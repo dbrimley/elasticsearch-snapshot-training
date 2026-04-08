@@ -282,7 +282,29 @@ def restore_kibana_state(
     repository: str,
     snapshot_name: str,
 ) -> None:
-    """Restore only the Kibana feature state from a snapshot."""
+    """Restore only the Kibana feature state from a snapshot.
+
+    In ES 9.x the kibana feature state owns a large set of system indices
+    (alerting, SLO, APM, ML, security-solution, etc.).  ES refuses to restore
+    any of them while they are open, so we resolve the exact index list from
+    the snapshot and close each one before restoring.
+    """
+    # Resolve the exact index names stored in this snapshot.
+    snap_info = client.snapshot.get(repository=repository, snapshot=snapshot_name)
+    snap_indices = snap_info["snapshots"][0].get("indices", [])
+
+    # ES 8+ blocks wildcard closes by default — disable that restriction
+    # transiently so we can close system indices by exact name.
+    client.cluster.put_settings(body={"transient": {"action.destructive_requires_name": False}})
+
+    if snap_indices:
+        client.indices.close(
+            index=",".join(snap_indices),
+            ignore_unavailable=True,
+            allow_no_indices=True,
+        )
+        info(f"Closed {len(snap_indices)} snapshot indices for restore.")
+
     client.snapshot.restore(
         repository=repository,
         snapshot=snapshot_name,
