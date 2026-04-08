@@ -1,0 +1,8 @@
+elasticsearch>=9.0.0
+requests
+boto3
+minio
+rich
+pandas
+ipykernel>=7.2.0
+jupyter_client>=8.8.0

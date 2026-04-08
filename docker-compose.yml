@@ -1,0 +1,104 @@
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION}
+    container_name: es01
+    environment:
+      - cluster.name=snapshot-training
+      - node.name=es01
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.license.self_generated.type=trial
+      - path.repo=/usr/share/elasticsearch/snapshots
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      - ./snapshot-repo:/usr/share/elasticsearch/snapshots
+    ports:
+      - "${ES_PORT}:9200"
+    networks:
+      - esnet
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  kibana-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION}
+    container_name: kibana-setup
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - esnet
+    restart: "no"
+    entrypoint: >
+      bash -c '
+        echo "Setting kibana_system password...";
+        until curl -s -u elastic:${ELASTIC_PASSWORD} -X POST http://elasticsearch:9200/_security/user/kibana_system/_password -H "Content-Type: application/json" -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do
+          echo "Waiting for ES to accept password change...";
+          sleep 5;
+        done;
+        echo "kibana_system password set.";
+      '
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${KIBANA_VERSION}
+    container_name: kibana01
+    depends_on:
+      kibana-setup:
+        condition: service_completed_successfully
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - KIBANA_PASSWORD=${KIBANA_PASSWORD}
+      - TELEMETRY_OPTIN=false
+      - SERVER_NAME=kibana-snapshot-training
+    volumes:
+      - ./kibana-config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    ports:
+      - "${KIBANA_PORT}:5601"
+    networks:
+      - esnet
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q 'available'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio01
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT}"
+    volumes:
+      - ./minio-data:/data
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    networks:
+      - esnet
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+volumes:
+  esdata:
+
+networks:
+  esnet:
+    driver: bridge

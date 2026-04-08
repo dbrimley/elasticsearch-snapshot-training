@@ -1,0 +1,18 @@
+server.host: "0.0.0.0"
+server.name: "kibana-snapshot-training"
+
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "${KIBANA_PASSWORD}"
+
+# Disable telemetry for training env
+telemetry.optIn: false
+telemetry.enabled: false
+
+# Static keys to prevent noisy "generating random key" warnings on restart
+xpack.encryptedSavedObjects.encryptionKey: "snapshot-training-32-char-key-xx"
+xpack.security.encryptionKey: "snapshot-training-security-key-xx"
+xpack.reporting.encryptionKey: "snapshot-training-reporting-key-x"
+
+# Logging
+logging.root.level: warn

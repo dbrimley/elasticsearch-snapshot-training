@@ -1,0 +1,17 @@
+# Python
+notebooks/.venv/
+notebooks/__pycache__/
+notebooks/es-snapshots/
+*.pyc
+
+# Snapshot repository data (runtime artefacts)
+snapshot-repo/
+
+# MinIO data (runtime artefacts)
+minio-data/
+
+# Environment secrets
+.env
+
+# VSCode
+.vscode/
