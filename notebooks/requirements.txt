@@ -4,5 +4,5 @@ boto3
 minio
 rich
 pandas
-ipykernel>=7.2.0
-jupyter_client>=8.8.0
+ipykernel>=6.0.0
+jupyter_client>=7.0.0
