@@ -338,6 +338,305 @@ def snap_delete_restore_cycle(snapshot_name: str, label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Data stream snapshot / restore helpers
+# ---------------------------------------------------------------------------
+
+_FLEET_PREFIXES = ("logs-", "metrics-", "traces-", ".fleet")
+
+
+def _is_fleet_stream(name: str) -> bool:
+    return any(name.startswith(p) for p in _FLEET_PREFIXES)
+
+
+def _template_exists(client: Elasticsearch, stream_name: str) -> bool:
+    """Return True if a composable index template matches the given stream name."""
+    try:
+        templates = client.indices.get_index_template()
+        for t in templates.get("index_templates", []):
+            for pattern in t.get("index_template", {}).get("index_patterns", []):
+                # Simple glob: replace * with a broad check
+                import fnmatch
+                if fnmatch.fnmatch(stream_name, pattern):
+                    ds_block = t.get("index_template", {}).get("data_stream")
+                    if ds_block is not None:
+                        return True
+        return False
+    except Exception:
+        return False
+
+
+def precheck_data_stream_restore(
+    client: Elasticsearch,
+    repository: str,
+    snapshot: str,
+    streams: list,
+    rename_to: dict = None,
+) -> bool:
+    """
+    Run pre-flight checks before restoring data streams. Never modifies anything.
+
+    Parameters
+    ----------
+    client      : Elasticsearch client
+    repository  : snapshot repository name
+    snapshot    : snapshot name
+    streams     : list of data stream names to restore
+    rename_to   : optional dict mapping original name → new name
+
+    Returns True if all checks pass (no blockers found), False if any blocker exists.
+    """
+    rename_to = rename_to or {}
+    heading("Pre-flight checks")
+    blockers = 0
+    warnings_ = 0
+
+    # 1. Snapshot exists and is SUCCESS
+    try:
+        meta = client.snapshot.get(repository=repository, snapshot=snapshot)
+        snap = meta["snapshots"][0]
+        state = snap["state"]
+        if state == "SUCCESS":
+            success(f"Snapshot '{snapshot}' found — state: {state}")
+        else:
+            warn(f"Snapshot '{snapshot}' state is {state} — restore may be incomplete")
+            warnings_ += 1
+    except Exception as e:
+        console.print(f"[bold red]✗[/bold red] Snapshot '{snapshot}' not found in '{repository}': {e}")
+        blockers += 1
+        return False
+
+    snap_streams = set(snap.get("data_streams", []))
+    snap_indices = set(snap.get("indices", []))
+    had_global_state = bool(snap.get("feature_states"))
+
+    if not had_global_state:
+        warn(
+            "Snapshot was taken without include_global_state=True — "
+            "composable templates are NOT in the snapshot. "
+            "Rollover will fail unless templates already exist on the target."
+        )
+        warnings_ += 1
+
+    # 2. Per-stream checks
+    for stream in streams:
+        target_name = rename_to.get(stream, stream)
+        console.print(f"\n[bold cyan]Stream:[/bold cyan] {stream}"
+                      + (f"  →  [bold cyan]{target_name}[/bold cyan]" if target_name != stream else ""))
+
+        # 2a. Stream is in the snapshot (not just backing indices)
+        if stream in snap_streams:
+            success(f"  '{stream}' is listed as a data stream in the snapshot")
+        else:
+            backing = [i for i in snap_indices if i.startswith(f".ds-{stream}")]
+            if backing:
+                console.print(
+                    f"  [bold red]✗[/bold red] '{stream}' is NOT listed as a data stream — "
+                    f"only its backing indices are in the snapshot ({len(backing)} found). "
+                    "Restoring by backing index name will produce plain indices, not a data stream."
+                )
+                blockers += 1
+            else:
+                console.print(f"  [bold red]✗[/bold red] '{stream}' not found in snapshot at all")
+                blockers += 1
+
+        # 2b. Composable template exists for the target name
+        if _template_exists(client, target_name):
+            success(f"  Composable template found for '{target_name}'")
+        else:
+            warn(
+                f"  No composable index template matches '{target_name}'. "
+                "Restore will succeed but rollover will fail until a template is created."
+            )
+            warnings_ += 1
+
+        # 2c. Stream already exists on target
+        try:
+            client.indices.get_data_stream(name=target_name)
+            warn(
+                f"  Data stream '{target_name}' already exists on this cluster. "
+                "It must be deleted before restoring under the same name."
+            )
+            warnings_ += 1
+        except Exception:
+            success(f"  '{target_name}' does not exist — safe to restore")
+
+        # 2d. Fleet-managed stream warning
+        if _is_fleet_stream(target_name):
+            warn(
+                f"  '{target_name}' looks like a Fleet-managed stream. "
+                "Do NOT restore with include_global_state=True — "
+                "reinstall Fleet integrations on the target first."
+            )
+            warnings_ += 1
+
+    # Summary
+    console.print()
+    if blockers:
+        console.print(f"[bold red]Pre-flight FAILED[/bold red] — {blockers} blocker(s), {warnings_} warning(s). Fix blockers before restoring.")
+    elif warnings_:
+        console.print(f"[bold yellow]Pre-flight PASSED WITH WARNINGS[/bold yellow] — {warnings_} warning(s). Review before proceeding.")
+    else:
+        console.print("[bold green]Pre-flight PASSED[/bold green] — all checks clean.")
+
+    return blockers == 0
+
+
+def safe_snapshot_data_stream(
+    client: Elasticsearch,
+    repository: str,
+    snapshot_name: str,
+    streams: list,
+) -> dict:
+    """
+    Take a complete, self-contained snapshot of one or more data streams.
+
+    Always uses include_global_state=True so composable templates travel
+    with the snapshot.  Warns about Fleet-managed streams.
+
+    Returns the completed snapshot metadata dict.
+    """
+    import warnings as _warnings
+    from elasticsearch import ElasticsearchWarning
+
+    heading(f"Snapshotting data streams: {streams}")
+
+    for stream in streams:
+        if _is_fleet_stream(stream):
+            warn(
+                f"'{stream}' is a Fleet-managed stream. Restoring its templates "
+                "via include_global_state=True may overwrite Fleet-owned templates on the target."
+            )
+
+    delete_snapshot_if_exists(client, repository, snapshot_name)
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always", ElasticsearchWarning)
+        result = client.snapshot.create(
+            repository=repository,
+            snapshot=snapshot_name,
+            body={
+                "indices": streams,
+                "include_global_state": True,
+            },
+            wait_for_completion=True,
+        )
+        for w in caught:
+            warn(f"ES: {w.message}")
+
+    snap = result["snapshot"]
+    success(f"Snapshot '{snapshot_name}' — state: {snap['state']}")
+    info(f"  Data streams   : {snap.get('data_streams', [])}")
+    info(f"  Backing indices: {len(snap.get('indices', []))} index(es)")
+    info(f"  Global state   : included (templates travel with snapshot)")
+    return snap
+
+
+def safe_restore_data_stream(
+    client: Elasticsearch,
+    repository: str,
+    snapshot: str,
+    streams: list,
+    rename_to: dict = None,
+    delete_existing: bool = True,
+    post_rollover: bool = True,
+) -> dict:
+    """
+    Safely restore one or more data streams from a snapshot.
+
+    Handles all common gotchas automatically:
+      - Runs pre-flight checks and aborts on blockers
+      - Deletes existing streams before restore (required by ES)
+      - Refuses to proceed if the composable template is missing
+      - Forces a rollover after restore to establish a clean write boundary
+      - Returns a result dict with stream name, doc count, and generation
+
+    Parameters
+    ----------
+    client          : Elasticsearch client
+    repository      : snapshot repository name
+    snapshot        : snapshot name
+    streams         : list of data stream names to restore
+    rename_to       : optional dict mapping original name → new name
+    delete_existing : delete the stream if it already exists (default True)
+    post_rollover   : force a rollover after restore (default True)
+    """
+    rename_to = rename_to or {}
+    results = {}
+
+    # Pre-flight
+    ok = precheck_data_stream_restore(client, repository, snapshot, streams, rename_to)
+    if not ok:
+        raise RuntimeError("Pre-flight checks failed — aborting restore. Fix blockers and retry.")
+
+    heading("Restoring data streams")
+
+    for stream in streams:
+        target = rename_to.get(stream, stream)
+
+        # Template check — hard stop, not just a warning
+        if not _template_exists(client, target):
+            raise RuntimeError(
+                f"No composable index template matches '{target}'. "
+                "Create a template with 'data_stream: {{}}' and index_patterns "
+                f"covering '{target}' before restoring."
+            )
+
+        # Delete existing stream if present
+        if delete_existing:
+            try:
+                client.indices.delete_data_stream(name=target)
+                info(f"Deleted existing data stream '{target}'")
+            except Exception:
+                pass
+
+        # Build restore body
+        body = {
+            "indices": [stream],
+            "include_global_state": False,  # template already verified on target
+        }
+        if target != stream:
+            body["rename_pattern"] = stream
+            body["rename_replacement"] = target
+
+        client.snapshot.restore(
+            repository=repository,
+            snapshot=snapshot,
+            body=body,
+            wait_for_completion=True,
+        )
+        client.indices.refresh(index=target)
+
+        doc_count = client.count(index=target)["count"]
+        ds_info = client.indices.get_data_stream(name=target)["data_streams"][0]
+        generation_after = ds_info["generation"]
+
+        success(f"Restored '{stream}' → '{target}'")
+        info(f"  Documents  : {doc_count}")
+        info(f"  Generation : {generation_after}")
+        info(f"  Backing    : {[i['index_name'] for i in ds_info['indices']]}")
+
+        # Post-restore rollover
+        if post_rollover:
+            client.indices.rollover(alias=target)
+            ds_after = client.indices.get_data_stream(name=target)["data_streams"][0]
+            new_write = ds_after["indices"][-1]["index_name"]
+            success(f"  Rollover complete — new write index: {new_write}")
+
+        results[stream] = {
+            "target": target,
+            "doc_count": doc_count,
+            "generation": generation_after,
+            "write_index": client.indices.get_data_stream(name=target)["data_streams"][0]["indices"][-1]["index_name"],
+        }
+
+    heading("Restore complete")
+    for original, r in results.items():
+        success(f"  {original} → {r['target']}  |  {r['doc_count']} docs  |  write index: {r['write_index']}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Kibana deep-link helper
 # ---------------------------------------------------------------------------
 
