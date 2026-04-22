@@ -14,6 +14,15 @@ except ImportError:
 import json
 import os
 import time
+from pathlib import Path
+
+# Load .env from the project root (one level up from this file) so that
+# ES_PORT and other docker-compose settings are picked up automatically.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+except ImportError:
+    pass
 
 import requests
 from elasticsearch import Elasticsearch
@@ -30,7 +39,8 @@ console = Console()
 # Client
 # ---------------------------------------------------------------------------
 
-ES_HOST = os.environ.get("ES_HOST", "http://localhost:9200")
+_es_port = os.environ.get("ES_PORT", "9200")
+ES_HOST = os.environ.get("ES_HOST", f"http://localhost:{_es_port}")
 KIBANA_HOST = os.environ.get("KIBANA_HOST", "http://localhost:5601")
 ELASTIC_PASSWORD = os.environ.get("ELASTIC_PASSWORD", "training123")
 KIBANA_PASSWORD = os.environ.get("KIBANA_PASSWORD", "training123")
@@ -53,6 +63,7 @@ def get_client() -> Elasticsearch:
         basic_auth=("elastic", ELASTIC_PASSWORD),
         verify_certs=False,
         ssl_show_warn=False,
+        request_timeout=300,
     )
 
 
@@ -511,19 +522,17 @@ def safe_snapshot_data_stream(
 
     with _warnings.catch_warnings(record=True) as caught:
         _warnings.simplefilter("always", ElasticsearchWarning)
-        result = client.snapshot.create(
+        client.snapshot.create(
             repository=repository,
             snapshot=snapshot_name,
-            body={
-                "indices": streams,
-                "include_global_state": True,
-            },
-            wait_for_completion=True,
+            indices=streams,
+            include_global_state=True,
+            wait_for_completion=False,
         )
         for w in caught:
             warn(f"ES: {w.message}")
 
-    snap = result["snapshot"]
+    snap = wait_for_snapshot(client, repository, snapshot_name)
     success(f"Snapshot '{snapshot_name}' — state: {snap['state']}")
     info(f"  Data streams   : {snap.get('data_streams', [])}")
     info(f"  Backing indices: {len(snap.get('indices', []))} index(es)")
