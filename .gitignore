@@ -3,6 +3,7 @@ notebooks/.venv/
 notebooks/__pycache__/
 notebooks/es-snapshots/
 *.pyc
+.venv/  
 
 # Snapshot repository data (runtime artefacts)
 snapshot-repo/
@@ -15,3 +16,6 @@ minio-data/
 
 # VSCode
 .vscode/
+
+# Claude
+.claude/
