@@ -646,6 +646,99 @@ def safe_restore_data_stream(
 
 
 # ---------------------------------------------------------------------------
+# Storage analysis helpers (used by module 10)
+# ---------------------------------------------------------------------------
+
+# Host-side path that mirrors the in-container path.repo bind mount.
+SNAPSHOT_REPO_HOST_PATH = Path(__file__).parent.parent / "snapshot-repo"
+
+
+def human_bytes(n: int) -> str:
+    """Format a byte count as a short human-readable string (e.g. '12.3 MB')."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:,.1f} {unit}"
+        n /= 1024.0
+    return f"{n:,.1f} PB"
+
+
+def repo_disk_size_bytes(subpath: str = "") -> int:
+    """
+    Sum the size of every file under ./snapshot-repo/<subpath> on the host.
+
+    This is ground-truth disk consumption — what an operator would see with
+    ``du -sb``. Complements ``snapshot_size_breakdown`` which uses the ES API.
+    """
+    root = SNAPSHOT_REPO_HOST_PATH / subpath if subpath else SNAPSHOT_REPO_HOST_PATH
+    if not root.exists():
+        return 0
+    total = 0
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def snapshot_size_breakdown(
+    client: Elasticsearch, repository: str, snapshot: str
+) -> dict:
+    """
+    Return the Elasticsearch-reported size of a snapshot, aggregated across shards.
+
+    Keys: total_bytes, incremental_bytes, total_files, incremental_files.
+    'incremental' = files this snapshot uploaded (excludes files reused from
+    earlier snapshots); 'total' = full size of all files referenced.
+    """
+    resp = client.snapshot.status(repository=repository, snapshot=snapshot)
+    snaps = resp.get("snapshots", [])
+    if not snaps:
+        return {"total_bytes": 0, "incremental_bytes": 0,
+                "total_files": 0, "incremental_files": 0}
+    stats = snaps[0].get("stats", {})
+    total = stats.get("total", {})
+    incremental = stats.get("incremental", {})
+    return {
+        "total_bytes": total.get("size_in_bytes", 0),
+        "incremental_bytes": incremental.get("size_in_bytes", 0),
+        "total_files": total.get("file_count", 0),
+        "incremental_files": incremental.get("file_count", 0),
+    }
+
+
+def segment_summary(client: Elasticsearch, index: str) -> dict:
+    """
+    Roll up per-shard segment info for an index.
+
+    Keys: num_segments, total_size_bytes, num_docs, deleted_docs.
+    'deleted_docs' surfaces tombstone overhead — docs marked deleted that
+    still consume space until a merge purges them.
+    """
+    resp = client.indices.segments(index=index)
+    num_segments = 0
+    total_size = 0
+    num_docs = 0
+    deleted_docs = 0
+    for idx_data in resp.get("indices", {}).values():
+        for shard_list in idx_data.get("shards", {}).values():
+            for shard in shard_list:
+                for seg in shard.get("segments", {}).values():
+                    num_segments += 1
+                    total_size += seg.get("size_in_bytes", 0)
+                    num_docs += seg.get("num_docs", 0)
+                    deleted_docs += seg.get("deleted_docs", 0)
+    return {
+        "num_segments": num_segments,
+        "total_size_bytes": total_size,
+        "num_docs": num_docs,
+        "deleted_docs": deleted_docs,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Kibana deep-link helper
 # ---------------------------------------------------------------------------
 

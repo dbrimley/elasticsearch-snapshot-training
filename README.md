@@ -154,6 +154,66 @@ Production patterns and edge cases:
 - **Failure handling** — partial snapshots, shard failures, and `_status` interpretation
 - **Security feature state** — backing up and restoring users, roles, role mappings, and API keys
 
+### 10 — Snapshot Storage Growth: Why Repo Size Can Exceed Ingested Data
+Proves with measurable before/after numbers why a snapshot repository on disk can grow larger than the data ingested — beyond what compression and dedup explain. Runs seven scenarios against a dedicated `growth_demo` repo, each followed by a snapshot, disk-walk, and segment-level measurement:
+- **A. Updates** — Lucene's delete-and-reinsert semantics; old segments stay pinned by earlier snapshots
+- **B. Deletes** — tombstones, not space reclamation, until merge
+- **C. Background segment merge** — merged segments are new files; pre-merge segments still pinned
+- **D. Force-merge to 1 segment** — the operational footgun where the repo roughly doubles
+- **E. High refresh rate** — many small segments amplify snapshot file counts (side-by-side comparison)
+- **F. Reindex** — entirely new segment files; old index still pinned by old snapshots
+- **G. Retention is the multiplier** — proof by deletion: pruning older snapshots actually shrinks the repo
+
+Ends with a rich summary table, matplotlib charts of repo-disk-over-time, and a mitigation cheat sheet (snapshot-before-merge ordering, retention tuning, source-only repos, searchable snapshots, data streams + ILM).
+
+---
+
+## Playwright UI Tests (Kibana Snapshot/Restore)
+
+The `playwright-tests/` directory contains a Playwright test suite that drives the Kibana Snapshot and Restore UI through the same scenarios covered in Module 05. Every test records a video, making it easy to share how the UI behaves — especially under failure conditions — without needing a live demo.
+
+### Prerequisites
+
+- Node.js 18+
+- The Docker stack must be running and healthy (`docker compose ps`)
+
+### Install
+
+```bash
+cd playwright-tests
+npm install
+npx playwright install chromium
+```
+
+### Run
+
+The recommended way is the **Playwright Test for VSCode** extension (`ms-playwright.playwright`). Install it from the Extensions panel, then open any file under `playwright-tests/` — a Testing icon appears in the Activity Bar with per-test run buttons, inline pass/fail status, a live browser view, and a built-in Trace Viewer that replays recordings step by step. The "Pick locator" tool is also useful for updating selectors against the live Kibana UI.
+
+To run from the terminal instead:
+
+```bash
+npx playwright test
+```
+
+Videos, screenshots, and traces are written to `playwright-tests/test-results/`. Open the HTML report with:
+
+```bash
+npx playwright show-report
+```
+
+### Test scenarios
+
+| File | What it demonstrates |
+|---|---|
+| `00-setup` | Registers the filesystem repository and takes the baseline snapshot used by all other tests |
+| `01-restore-index-exists` | **Failure:** restore rejected because the target index is already open |
+| `02-restore-with-rename` | **Success path:** rename on restore avoids the index-conflict error |
+| `03-restore-settings-override` | **Failure:** restore rejected when attempting to change `number_of_shards` (immutable) |
+| `04-restore-failure-states` | **Failure:** broken repository — Kibana surfaces the verification error |
+| `05-restore-progress` | **In-progress state:** Restore Activity tab showing active shard recovery |
+
+> **Note:** The tests use a mix of `data-test-subj` attributes and role/text selectors. If Kibana's wizard button labels differ in your version, the selectors in [`fixtures/kibana-page.ts`](playwright-tests/fixtures/kibana-page.ts) are the single place to update them.
+
 ---
 
 ## Stopping the Environment
