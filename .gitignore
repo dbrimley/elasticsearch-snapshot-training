@@ -19,3 +19,10 @@ minio-data/
 
 # Claude
 .claude/
+
+# Playwright
+playwright-tests/node_modules/
+playwright-tests/playwright/.auth/
+playwright-tests/test-results/
+playwright-tests/playwright-report/
+playwright-tests/dist/
